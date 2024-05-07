@@ -4,14 +4,21 @@ import numpy as np
 # import requests
 # import sys
 import os
-import matplotlib.pyplot as plt
-from sklearn import linear_model, preprocessing
-from sklearn.metrics import r2_score
-from sklearn.model_selection import train_test_split
-from sklearn.neighbors import KNeighborsClassifier
-from sklearn import metrics
-from sklearn.tree import DecisionTreeClassifier, export_graphviz
 import subprocess
+# import pprint
+import time
+import matplotlib.pyplot as plt
+# sklearn
+from sklearn import linear_model, preprocessing
+from sklearn import metrics
+from sklearn.metrics import r2_score, roc_auc_score, accuracy_score
+from sklearn.model_selection import train_test_split
+from sklearn.utils.class_weight import compute_sample_weight
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.tree import DecisionTreeClassifier, export_graphviz
+# from sklearn.svm import LinearSVC
+# snapml
+from snapml import DecisionTreeClassifier as snapml_DecisionTreeClassifier
 
 
 def simple_linear_regression(df: pd.DataFrame, mask_percent: float, col_x: str, col_y: str):
@@ -162,9 +169,8 @@ def knn(df: pd.DataFrame, target_col_name: str, k: int, test_size: float, random
 
     # Converting DataFrame to Numpy array for features and labels
     x = df[df.columns.tolist()].values  # Dataset
-    y = df[target_col_name].values      # Target variable
     # x = df.drop(columns=[target_col_name]).values  # Remove the target column for feature set
-    # y = df[target_col_name].values  # Target variable
+    y = df[target_col_name].values      # Target variable
 
     # Normalize the feature set
     x = preprocessing.StandardScaler().fit_transform(x.astype(float))
@@ -197,7 +203,7 @@ def knn(df: pd.DataFrame, target_col_name: str, k: int, test_size: float, random
         plt.show()
 
     else:
-        # K-Nearest Neighbors Classification
+        # K-Nearest Neighbors Modeling
         neigh = KNeighborsClassifier(n_neighbors=k)
         neigh.fit(x_train, y_train)  # Training the model
 
@@ -208,22 +214,35 @@ def knn(df: pd.DataFrame, target_col_name: str, k: int, test_size: float, random
 
 
 def decision_tree_classifier(df: pd.DataFrame, target_col_name: str, test_size: float, random_state: int, criterion: str = "entropy",
-                             max_depth: int = None, dot_filename: str = "tree.dot", label_encoder_dict: dict = None):
+                             max_depth: int = None, dot_filename: str = "tree.dot", label_encoder_dict: dict = None, export_graph: bool = True,
+                             target_class_distribution: str = 'balanced', drop_col: list = None, normalize: bool = False, standardize: bool = False,
+                             replicas: int = None, library: str = 'sklearn', eval_metrics: bool = True):
     """
     Train and visualize a decision tree classifier.
 
     Parameters:
         df (pd.DataFrame): The input DataFrame.
-        target_col_name (str): The name of the target variable column.
-        criterion (str): The function to measure the quality of a split. Default is "entropy".
+        target_col_name (str): The name of the target variable column to classify.
+        test_size (float): The proportion of the dataset to include in the test split.
+        random_state (int): The seed used by the random number generator for reproducibility.
+        criterion (str): The function to measure the quality of a split.
+            Default is "entropy" for information gain, slow due to logarithmic calculations,
+            alternative is "gini" that measure the impurity of the node.
         max_depth (int): The maximum depth of the tree.
         dot_filename (str): The filename for the exported dot file.
         label_encoder_dict (dict): Dictionary of column names and their respective LabelEncoder() instances.
             Sklearn Decision Trees does not handle categorical variables.
             Use LabelEncoder() method to convert these features to numerical values.
             for example Low High to 0 and 1.
-        test_size (float): The proportion of the dataset to include in the test split.
-        random_state (int): The seed used by the random number generator for reproducibility.
+        export_graph (bool): Enable or Disables exportation of decision tree graph
+        target_class_distribution (str): balanced or unbalanced.
+            if unbalanced ensures random split of the data with same proportion of each class as observed in the original dataset.
+        drop_col (list) : list of columns to drop from the dataframe
+        normalize (bool) : apply data normalization
+        standardize (bool) : standardize features by removing the mean and scaling to unit variance
+        replicas (int): inflates dataset for testing with replicas
+        library (str): 'sklearn' or 'snapml'
+        eval_metrics (bool): evaluate model for accuracy and ROC-AUC metrics
 
     Example:
     file = "drug200.csv"
@@ -239,59 +258,162 @@ def decision_tree_classifier(df: pd.DataFrame, target_col_name: str, test_size: 
     ml.decision_tree_classifier(df, 'Drug', test_size=0.3, random_state=3, max_depth=4, label_encoder_dict=label_encoder_dict)
     """
 
-    def generate_tree_image(dot_file='tree.dot', output_image='tree.png'):
-        """
-        Executes a shell command to convert a Graphviz dot file to a PNG image file.
+    if drop_col:
+        df = drop_columns(df=df, drop_col=drop_col)
 
-        Parameters:
-            dot_file (str): The path to the dot file.
-            output_image (str): The output image file path.
-        """
-        # Build the command as a list of parts
-        command = ['dot', '-Tpng', dot_file, '-o', output_image]
+    if replicas:
+        df = pd.DataFrame(np.repeat(df.values, replicas, axis=0), columns=df.columns)
 
-        # Execute the command
-        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    # Dataset description"
+    print(f'dataset description: \n{df.head()}')
+    print(f'shape: {df.shape}')
+    print(f'observations: {str(len(df))}')
+    print(f'variables {str(len(df.columns))}')
+    labels = df[target_col_name].unique()
+    sizes = df[target_col_name].value_counts().values
+    print(f'labels : {labels}')  # get the set of distinct target column values
+    print(f'sizes : {sizes}')  # get the count for each of the target column values
 
-        # Check if the command was successful
-        if result.returncode == 0:
-            print(f"Generated image successfully at '{output_image}'.")
-        else:
-            print(f"Failed to generate image. Error: {result.stderr}")
-
-    print(df.head())
-    print(df.shape)
-    print(df[target_col_name].value_counts())
-    print(f'Before using label encoder:\n {df.drop(target_col_name, axis=1).values[0:5]}')
+    # plot Target column value counts
+    fig, ax = plt.subplots()
+    ax.pie(sizes, labels=labels, autopct='%1.3f%%')
+    ax.set_title('Target Column Value Counts')
+    plt.show()
 
     # Encode categorical variables using LabelEncoder
-    for column, encoder in label_encoder_dict.items():
-        df[column] = encoder.fit_transform(df[column])
+    if label_encoder_dict:
+        print(f'Before using label encoder:\n {df.drop(labels=target_col_name, axis=1).values[0:5]}')
+        for column, encoder in label_encoder_dict.items():
+            df[column] = encoder.fit_transform(df[column])
+        print(f'After using label encoder:\n {df.drop(labels=target_col_name, axis=1).values[0:5]}')
 
-    # Splitting the dataset into features and target variable
-    x = df.drop(target_col_name, axis=1).values
-
-    print(f'After using label encoder:\n {x[0:5]}')
-
+    # Splitting the dataset into features X and target variable Y
+    x = df.drop(labels=target_col_name, axis=1).values
     y = df[target_col_name].values
 
-    # Splitting the data into train and test sets
-    x_train, x_test, y_train, y_test = train_test_split(x, y, test_size=test_size, random_state=random_state)
+    # standardize features by removing the mean and scaling to unit variance
+    if standardize:
+        scaler = preprocessing.StandardScaler()
+        x = scaler.fit_transform(X=x)
 
-    # Modeling and Training the Decision Tree
-    drug_tree = DecisionTreeClassifier(criterion=criterion, max_depth=max_depth)
-    drug_tree.fit(x_train, y_train)
+    # data normalization
+    if normalize:
+        x = preprocessing.normalize(x, norm="l1")
+
+    # Splitting the data into train and test sets
+    if target_class_distribution == 'balanced':
+        x_train, x_test, y_train, y_test = train_test_split(x, y, test_size=test_size, random_state=random_state)
+        w_train = None
+    elif target_class_distribution == 'unbalanced':
+        x_train, x_test, y_train, y_test = train_test_split(x, y, test_size=test_size, random_state=random_state, stratify=y)
+        # compute the sample weights to be used as input to the train routine to take into account the class imbalance of the dataset
+        w_train = compute_sample_weight(class_weight='balanced', y=y_train)
+
+    print('x_train.shape=', x_train.shape, 'y_train.shape=', y_train.shape)
+    print('x_test.shape=', x_test.shape, 'y_test.shape=', y_test.shape)
+
+    # Modeling the Decision Tree
+    if library == 'sklearn':
+        tree = DecisionTreeClassifier(criterion=criterion, max_depth=max_depth, random_state=random_state)
+    elif library == 'snapml':
+        # CPU training
+        # to set the number of CPU threads used at training time, set the n_jobs parameter
+        tree = snapml_DecisionTreeClassifier(max_depth=4, random_state=45, n_jobs=4)
+
+        # GPU training - only supports Nvidia cards with CUDA support
+        # Snap ML offers multi-threaded CPU/GPU training of decision trees, unlike scikit-learn
+        # tree = snapml_DecisionTreeClassifier(max_depth=4, random_state=45, use_gpu=True)
+    else:
+        print(f'Error: library does not exist, please select "sklearn" or "snapml".')
+        return None
+
+    # Training the model
+    t0 = time.time()
+    # Note: typehints below for x and y are not used to be able to make it work for both snapml or sklearn inter-changeably
+    tree.fit(x_train, y_train, sample_weight=w_train)
+    learn_time = time.time() - t0
+    print(f'{library}'+" Training time (s):  {0:.5f}".format(learn_time))  # Estimate computation time
 
     # Predicting the test set results
-    y_pred = drug_tree.predict(x_test)
+    y_pred = tree.predict(X=x_test)
 
     # Evaluating the model
-    print("Decision Tree Accuracy: ", metrics.accuracy_score(y_test, y_pred))
+    if eval_metrics:
+        print("Decision Tree Accuracy score: ", accuracy_score(y_true=y_test, y_pred=y_pred))
 
-    # Export the trained model to a dot file
-    export_graphviz(drug_tree, out_file=dot_filename, filled=True, feature_names=df.drop(target_col_name, axis=1).columns.tolist())
-    generate_tree_image(dot_file=dot_filename, output_image=dot_filename.replace('.dot', '.png'))
+        num_classes = len(labels)
+        if num_classes == 2:
+            # ROC - AUC or (Receiver Operating Characteristic - Area Under Curve)
+            # To calculate ROC-AUC score predicted probabilities are needed instead of hard class labels.
+            # The ROC curve plots the true positive rate (TPR) against the false positive rate (FPR) at various threshold settings.
+            # ROC-AUC evaluates a classifier's performance across all possible classification thresholds.
 
-    # Open the tree image; adjust the command according to your OS
-    os.system(f'open {dot_filename.replace(".dot", ".png")}')
+            # run inference and compute the probabilities of the test samples
+            # to belong to the class of fraudulent transactions
+            y_pred_prob = tree.predict_proba(X=x_test)[:, 1]
 
+            # evaluate the Compute Area Under the Receiver Operating Characteristic
+            # Curve (ROC-AUC) score from the predictions
+            # roc_auc = roc_auc_score(y_test, y_pred_prob)
+            # print(f'{library}' + "ROC-AUC score : {0:.3f}".format(roc_auc))
+
+            print("Decision Tree ROC-AUC Score: ", roc_auc_score(y_true=y_test, y_score=y_pred_prob))
+        else:
+            print('ROC-AUC only supported for binary class')
+
+    # Export the trained model to a Graphviz format
+    if export_graph:
+
+        if library == 'sklearn':
+            export_graphviz(decision_tree=tree, out_file=dot_filename, filled=True, feature_names=df.drop(target_col_name, axis=1).columns.tolist())
+            generate_tree_image(dot_file=dot_filename, output_image=dot_filename.replace('.dot', '.png'))
+
+            # Open the tree image; adjust the command according to your OS
+            os.system(f'open {dot_filename.replace(".dot", ".png")}')
+        else:
+            print('exporting the model to a Graphviz format not possible with snapml library')
+
+
+def drop_columns(df: pd.DataFrame, drop_col: list = None) -> pd.DataFrame:
+    """
+    Creates a new DataFrame by dropping specified columns.
+
+    Parameters:
+    df (pd.DataFrame): The original DataFrame.
+    drop_col (list, optional): A list of column names to be dropped. Default is None.
+
+    Returns:
+    pd.DataFrame: A new DataFrame with specified columns removed.
+    :rtype: pd.DataFrame
+    """
+    if drop_col and all(col in df.columns for col in drop_col):
+        # Drop the specified columns if all are present in the DataFrame
+        return df.drop(columns=drop_col)
+    elif drop_col:
+        # Handle the case where some columns might not exist in the DataFrame
+        valid_columns = [col for col in drop_col if col in df.columns]
+        return df.drop(columns=valid_columns)
+    else:
+        # If drop_col is None or empty, return the original DataFrame unchanged
+        return df.copy()
+
+
+def generate_tree_image(dot_file='tree.dot', output_image='tree.png'):
+    """
+    Executes a shell command to convert a Graphviz dot file to a PNG image file.
+
+    Parameters:
+        dot_file (str): The path to the dot file.
+        output_image (str): The output image file path.
+    """
+    # Build the command as a list of parts
+    command = ['dot', '-Tpng', dot_file, '-o', output_image]
+
+    # Execute the command
+    result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    # Check if the command was successful
+    if result.returncode == 0:
+        print(f"Generated image successfully at '{output_image}'.")
+    else:
+        print(f"Failed to generate image. Error: {result.stderr}")
